@@ -5,24 +5,25 @@ import helmet from 'helmet'
 import cors from 'cors'
 import rateLimit from 'express-rate-limit'
 import preregisterRoute from './routes/preregister.js'
+import gameRoute from './routes/game.js'
 
 const app = express()
 
-// ✅ CORS أولاً
+// CORS واضح وصارم
 const allowedOrigins = new Set([
-  'https://1cryptox.com',
-  'https://www.1cryptox.com',
-  // إذا عندك نطاقات أخرى للواجهة، أضِفها هنا
-  'http://localhost:5173'
-])
+  'https://1cryptox.com',           // مثال: https://1cryptox.com
+  'https://www.1cryptox.com',       // مثال: 
+  'http://localhost:5173'              // للتطوير
+].filter(Boolean))
 
 const corsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true)                 // أدوات مثل curl/Postman
+    if (!origin) return cb(null, true) // curl/Postman
+    if (allowedOrigins.size === 0) return cb(null, true) // سماح للجميع إن لم تُحدِّد
     if (allowedOrigins.has(origin)) return cb(null, true)
     return cb(new Error('Not allowed by CORS'))
   },
-  credentials: false, // اجعلها true فقط إذا تستخدم Cookies/Session عبر المتصفح
+  credentials: false,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
   optionsSuccessStatus: 204
@@ -30,16 +31,26 @@ const corsOptions = {
 app.use(cors(corsOptions))
 app.options('*', cors(corsOptions))
 
-// ثم الباقي
 app.use(helmet())
 app.use(express.json())
-app.use('/api/', rateLimit({ windowMs: 60_000, max: 60 }))
+
+// تحديد معدّل الطلبات
+app.use('/api/', rateLimit({ windowMs: 60_000, max: 120 }))
+
+// الراوتس
 app.use('/api/preregister', preregisterRoute)
+app.use('/api/game', gameRoute)
 
-const PORT = process.env.PORT || 4000
-const MONGO_URI = process.env.MONGO_URI
+// صحّة الخادم
+app.get('/api/health', (_req, res) => res.json({ ok: true }))
 
-mongoose.connect(MONGO_URI).then(() => {
+// اتصال قاعدة البيانات
+const MONGO_URI = process.env.MONGO_URI || ''
+if (!MONGO_URI) {
+  console.warn('⚠️ MONGO_URI is not set; please set it in your environment.')
+}
+mongoose.connect(MONGO_URI, { autoIndex: true }).then(() => {
+  const PORT = process.env.PORT || 4000
   console.log('Mongo connected')
   app.listen(PORT, () => console.log(`Server running on :${PORT}`))
 }).catch((err) => {
