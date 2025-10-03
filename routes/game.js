@@ -1,4 +1,3 @@
-// backend/routes/game.js
 import { Router } from 'express';
 import crypto from 'crypto';
 import GameWallet from '../models/GameWallet.js';
@@ -6,18 +5,46 @@ import GameSession from '../models/GameSession.js';
 
 const router = Router();
 
-/** === Coin→Cent rules per mode ===
- *  Endless: 5 coins  = 1 cent
- *  Arena  : 15 coins = 1 cent
+/** Progressive conversion:
+ *  < $2     => 30 coins / cent
+ *  $2-$4.99 => 70 coins / cent
+ *  >= $5    => 120 coins / cent
  */
-const COINS_PER_CENT_ENDLESS = 5;
-const COINS_PER_CENT_ARENA = 15;
+function coinsPerCentFor(balanceCents) {
+  const dollars = (balanceCents || 0) / 100;
+  if (dollars < 2) return 30;
+  if (dollars < 5) return 70;
+  return 120;
+}
 
-// --- Start session ---
+/** Convert coins progressively across tiers.
+ *  Returns { rewardCents, remainderCoins, newBalanceCents }
+ */
+function convertCoinsProgressive({ startingBalanceCents, coinsTotal }) {
+  let balanceCents = startingBalanceCents;
+  let pool = Math.max(0, Math.floor(coinsTotal || 0));
+  let minted = 0;
+
+  // Mint one cent at a time so we can update rate once crossing thresholds
+  while (true) {
+    const rate = coinsPerCentFor(balanceCents);
+    if (pool < rate) break;
+    pool -= rate;
+    minted += 1;
+    balanceCents += 1; // we just minted 1 cent, balance increases → may change tier
+  }
+
+  return {
+    rewardCents: minted,
+    remainderCoins: pool,
+    newBalanceCents: balanceCents,
+  };
+}
+
+// --- Start a session ---
 router.post('/start', async (req, res) => {
   try {
     const { email } = req.body || {};
-    // allow optional mode from client; default to 'endless'
     let { mode } = req.body || {};
     mode = mode === 'arena' ? 'arena' : 'endless';
 
@@ -28,12 +55,12 @@ router.post('/start', async (req, res) => {
     // Ensure wallet exists
     await GameWallet.updateOne(
       { email },
-      { $setOnInsert: { email, balanceCents: 0 } },
+      { $setOnInsert: { email, balanceCents: 0, pendingCoins: 0, totalCoins: 0 } },
       { upsert: true }
     );
 
-    // Create session with chosen mode
     await GameSession.create({ sessionId, email, mode });
+
     return res.json({ sessionId, mode });
   } catch (e) {
     console.error(e);
@@ -41,21 +68,27 @@ router.post('/start', async (req, res) => {
   }
 });
 
-// --- Wallet balance ---
+// --- Get wallet balance ---
 router.get('/wallet', async (req, res) => {
   try {
     const email = (req.query.email || '').trim();
     if (!email) return res.status(400).json({ message: 'Email is required' });
+
     let wallet = await GameWallet.findOne({ email });
-    if (!wallet) wallet = await GameWallet.create({ email, balanceCents: 0 });
-    return res.json({ email, balanceCents: wallet.balanceCents || 0 });
+    if (!wallet) wallet = await GameWallet.create({ email, balanceCents: 0, pendingCoins: 0 });
+
+    return res.json({
+      email,
+      balanceCents: wallet.balanceCents || 0,
+      pendingCoins: wallet.pendingCoins || 0,
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ message: 'Server error' });
   }
 });
 
-// --- Finish session ---
+// --- Finish a session ---
 router.post('/finish', async (req, res) => {
   try {
     const { sessionId, coins = 0, elapsedMs = 0 } = req.body || {};
@@ -66,18 +99,19 @@ router.post('/finish', async (req, res) => {
 
     if (sess.finishedAt) {
       // idempotent
-      const wallet = await GameWallet.findOne({ email: sess.email });
+      const walletPrev = await GameWallet.findOne({ email: sess.email });
       return res.status(200).json({
         message: 'Already finished',
         rewardCents: sess.rewardCents,
-        balanceCents: wallet?.balanceCents ?? 0
+        balanceCents: walletPrev?.balanceCents ?? 0,
       });
     }
 
-    // Basic anti-abuse timing checks
+    // Anti-abuse: server-time sanity
     const now = Date.now();
     const started = new Date(sess.startedAt).getTime();
     const serverElapsed = now - started;
+
     if (elapsedMs <= 0 || elapsedMs > 10 * 60 * 1000) {
       return res.status(400).json({ message: 'Invalid elapsed time' });
     }
@@ -85,30 +119,47 @@ router.post('/finish', async (req, res) => {
       return res.status(400).json({ message: 'Session timed out' });
     }
 
-    const safeCoins = Math.max(0, Math.min(100000, Number(coins)));
+    // Clamp coins
+    const safeCoins = Math.max(0, Math.min(100000, Number(coins) || 0));
 
-    // Compute reward based on the session's mode
-    const perCent =
-      sess.mode === 'arena' ? COINS_PER_CENT_ARENA : COINS_PER_CENT_ENDLESS;
-    const earnedCents = Math.floor(safeCoins / perCent); // integer cents
+    // Fetch wallet
+    let wallet = await GameWallet.findOne({ email: sess.email });
+    if (!wallet) {
+      wallet = await GameWallet.create({
+        email: sess.email,
+        balanceCents: 0,
+        pendingCoins: 0,
+        totalCoins: 0,
+      });
+    }
 
-    // Save session + wallet
+    // Pool = previous pending + this session coins
+    const pool = (wallet.pendingCoins || 0) + safeCoins;
+
+    const { rewardCents, remainderCoins, newBalanceCents } =
+      convertCoinsProgressive({
+        startingBalanceCents: wallet.balanceCents || 0,
+        coinsTotal: pool,
+      });
+
+    // Save session
     sess.finishedAt = new Date();
     sess.coins = safeCoins;
-    sess.rewardCents = earnedCents;
+    sess.rewardCents = rewardCents;
     await sess.save();
 
-    const wallet = await GameWallet.findOneAndUpdate(
-      { email: sess.email },
-      { $inc: { balanceCents: earnedCents } },
-      { new: true, upsert: true }
-    );
+    // Update wallet
+    wallet.balanceCents = newBalanceCents;
+    wallet.pendingCoins = remainderCoins;
+    wallet.totalCoins = (wallet.totalCoins || 0) + safeCoins;
+    await wallet.save();
 
     return res.json({
       message: 'Round finished',
-      rewardCents: earnedCents,
-      balanceCents: wallet?.balanceCents ?? earnedCents,
-      mode: sess.mode
+      rewardCents,
+      balanceCents: wallet.balanceCents,
+      pendingCoins: wallet.pendingCoins,
+      mode: sess.mode,
     });
   } catch (e) {
     console.error(e);
